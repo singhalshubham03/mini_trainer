@@ -1046,10 +1046,15 @@ def setup_model(
         base_model_args["attn_implementation"] = "sdpa"
         log_rank_0(f"Using SDPA for {model_name_or_path} (model incompatible with Flash Attention 2)")
     elif device_utils.get_device_type() == "xpu":
-        # flash_attn is CUDA-only. SDPA still isolates padding-free packed
-        # sequences: transformers derives a block-diagonal mask from position_ids.
-        base_model_args["attn_implementation"] = "sdpa"
-        log_rank_0(f"Using SDPA for {model_name_or_path} on Intel XPU")
+        if is_gpt_oss:
+            # GPT-OSS needs flash-attn3 (attention sinks), which has no XPU build
+            base_model_args["attn_implementation"] = "eager"
+            log_rank_0("GPT-OSS: flash-attn3 is not available on Intel XPU. Using eager attention instead.")
+        else:
+            # flash_attn is CUDA-only; the hub kernel has XPU builds (SDPA if it can't load).
+            # Both keep padding-free packed sequences isolated through position_ids.
+            base_model_args["attn_implementation"] = device_utils.xpu_flash_attn_implementation()
+            log_rank_0(f"Using {base_model_args['attn_implementation']} for {model_name_or_path} on Intel XPU")
     else:
         # Check if flash_attn is available for non-SDPA models
         try:

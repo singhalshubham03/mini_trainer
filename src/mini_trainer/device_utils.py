@@ -7,9 +7,17 @@ CUDA remains the default: XPU is selected only when an XPU is present and CUDA
 is not, so behavior on CUDA and CPU-only hosts is unchanged.
 """
 
+import functools
+import logging
 import os
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Hugging Face hub flash-attention kernel with Intel XPU builds: the XPU
+# counterpart of flash_attention_2 (the flash_attn package is CUDA/ROCm only).
+XPU_FLASH_ATTN_KERNEL = "kernels-community/flash-attn2"
 
 
 def get_device_type() -> str:
@@ -81,3 +89,26 @@ def get_rng_state() -> torch.Tensor:
 
 def set_rng_state(state: torch.Tensor) -> None:
     get_device_module().set_rng_state(state)
+
+
+@functools.cache
+def xpu_flash_attn_implementation() -> str:
+    """Attention implementation for padding-free (packed) training on XPU.
+
+    Returns the hub flash-attention kernel when it can be loaded (needs the
+    ``kernels`` package, see the ``xpu`` extra), else ``"sdpa"``. Both keep
+    packed sequences isolated through ``position_ids``.
+    """
+    try:
+        from transformers.integrations.hub_kernels import load_and_register_attn_kernel
+
+        load_and_register_attn_kernel(XPU_FLASH_ATTN_KERNEL)
+        return XPU_FLASH_ATTN_KERNEL
+    except Exception as exc:
+        logger.warning(
+            "Flash attention kernel %s unavailable on XPU (%s); using SDPA instead. "
+            "Install it with `pip install rhai-innovation-mini-trainer[xpu]`.",
+            XPU_FLASH_ATTN_KERNEL,
+            exc,
+        )
+        return "sdpa"

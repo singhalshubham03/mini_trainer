@@ -1,5 +1,7 @@
 """Tests for accelerator selection in mini_trainer.device_utils."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -73,3 +75,60 @@ def test_real_xpu_selected_when_no_cuda():
     t = torch.ones(4, device=device_utils.get_device(0))
     assert t.device.type == "xpu"
     assert device_utils.memory_allocated() > 0
+
+
+@pytest.fixture
+def _fresh_attn_choice():
+    device_utils.xpu_flash_attn_implementation.cache_clear()
+    yield
+    device_utils.xpu_flash_attn_implementation.cache_clear()
+
+
+@pytest.mark.usefixtures("_fresh_attn_choice")
+def test_xpu_attn_uses_hub_flash_kernel():
+    with patch("transformers.integrations.hub_kernels.load_and_register_attn_kernel") as load:
+        assert device_utils.xpu_flash_attn_implementation() == device_utils.XPU_FLASH_ATTN_KERNEL
+    load.assert_called_once_with(device_utils.XPU_FLASH_ATTN_KERNEL)
+
+
+@pytest.mark.usefixtures("_fresh_attn_choice")
+def test_xpu_attn_falls_back_to_sdpa_when_kernel_unavailable(caplog):
+    with patch(
+        "transformers.integrations.hub_kernels.load_and_register_attn_kernel",
+        side_effect=ImportError("kernels is not installed"),
+    ):
+        assert device_utils.xpu_flash_attn_implementation() == "sdpa"
+    assert "using SDPA instead" in caplog.text
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not (hasattr(torch, "xpu") and torch.xpu.is_available()), reason="Intel XPU not available")
+@pytest.mark.usefixtures("_fresh_attn_choice")
+def test_packed_sequences_isolated_with_xpu_attention():
+    # Padding-free batches pack samples into one row; attention must not cross
+    # sample boundaries. Compare against running each sample on its own.
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    impl = device_utils.xpu_flash_attn_implementation()
+    torch.manual_seed(0)
+    cfg = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        attn_implementation=impl,
+    )
+    model = LlamaForCausalLM(cfg).to("xpu", torch.bfloat16).eval()
+    assert model.config._attn_implementation == impl
+    lens = [7, 19, 4]
+    seqs = [torch.randint(0, 128, (n,), device="xpu") for n in lens]
+    ids = torch.cat(seqs)[None]
+    pos = torch.cat([torch.arange(n, device="xpu") for n in lens])[None]
+    with torch.no_grad():
+        separate = torch.cat([model(s[None]).logits[0] for s in seqs]).float()
+        packed = model(ids, position_ids=pos, use_cache=False).logits[0].float()
+        leaky = model(ids, use_cache=False).logits[0].float()  # no isolation
+    assert (packed - separate).abs().max() < 0.05, impl
+    assert (leaky - separate).abs().max() > 0.1  # the check can see leakage
